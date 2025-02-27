@@ -1,7 +1,10 @@
+from concurrent.futures.thread import ThreadPoolExecutor
+from itertools import combinations
 from typing import (
     Any,
     Optional,
     Sequence,
+    cast,
 )
 
 import matplotlib.pyplot as plt
@@ -10,11 +13,26 @@ import pandas as pd
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap, hex2color, rgb2hex
 from numpy.typing import NDArray
+from scipy.stats import (
+    kendalltau,
+    kruskal,
+    spearmanr,
+    chi2_contingency,
+    chisquare,
+)
 from sklearn.decomposition import PCA
+from tqdm import tqdm
 
-from scipy.stats import chisquare, chisquare
+from __scripts__.typ import BasicDataType, StatResult
 
-from __scripts__.types import BasicDataType, DataTypeDict
+DEFAULT_FIGSIZE = (30, 16)
+DEFAULT_FONTSIZE = 24  # TODO: IMPLEMENT
+DEFAULT_COLOR_LIST = ["red", "orange", "blue", "green"]
+DEFAULT_HEATMAP = LinearSegmentedColormap.from_list(
+    "correlation", colors=["#4e0707", "#ffffff", "#000435"]
+)
+
+plt.rcParams.update({"font.size": DEFAULT_FONTSIZE})
 
 
 def assign_colors(class_list: Sequence[Any], color_list=None):
@@ -34,7 +52,7 @@ def assign_colors(class_list: Sequence[Any], color_list=None):
         List of colors in hex format corresponding to each class
     """
     if color_list is None:
-        color_list = ["red", "orange", "blue", "green"]
+        color_list = DEFAULT_COLOR_LIST
 
     n_classes = len(class_list)
     n_colors = len(color_list)
@@ -59,171 +77,293 @@ def assign_colors(class_list: Sequence[Any], color_list=None):
     return interpolated_colors
 
 
-def plot_monovariate_violin(
-    df: pd.DataFrame,
-    dtype_dict: DataTypeDict,
-    num_plots_x: int,
-    num_plots_y: int,
+def find_corr(
+    x: pd.Series,
+    y: pd.Series,
+    x_type: BasicDataType,
+    y_type: BasicDataType,
 ):
-    fig, axes = plt.subplots(num_plots_y, num_plots_x, figsize=(12, 8))
-    fig.tight_layout()
-    axes = axes.flatten()
+    if x_type.is_categorical():
+        x_cats = x.unique()
+        x_cats.sort()
 
-    for i, x in enumerate(df.columns.to_list()):
-        if dtype_dict[x].is_categorical():
-            filter_df = df[x].dropna().sort_values(ascending=True)
+    if y_type.is_categorical():
+        y_cats = y.unique()
+        y_cats.sort()
 
-            sns.violinplot(x=filter_df.astype(str), ax=axes[i])
-        else:
-            filter_df = df[x].dropna()
-            sns.violinplot(x=filter_df, ax=axes[i])
+    match x_type, y_type:
+        # Main reference is doi:10.1177/8756479308317006
+        case BasicDataType.CONTINUOUS, BasicDataType.CONTINUOUS:
+            # spearmanr
+            # can also use pearson r
 
-    n_diff = num_plots_x * num_plots_y - len(df.columns)
-    if n_diff:
-        for i in range(n_diff):
-            fig.delaxes(axes[-(i + 1)])
+            res_kw = spearmanr(x, y, alternative="two-sided")
+            return StatResult(r"\rho", res_kw.statistic, res_kw.pvalue)
 
-    plt.suptitle("Feature Violin Plots")
-    plt.show(block=False)
+        case BasicDataType.ORDINAL, BasicDataType.ORDINAL:
+            # kendall tau b or c
+            # can also be spearmanr
+
+            if len(x_cats) == len(y_cats):
+                res_kw = kendalltau(x, y, variant="b", alternative="two-sided")
+            else:
+                res_kw = kendalltau(x, y, variant="c", alternative="two-sided")
+            return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
+
+        case BasicDataType.NOMINAL, BasicDataType.NOMINAL:
+            # goodman and kruskal lambda
+
+            # table = pd.DataFrame(index=x_cats, columns=y_cats)
+            # for x_cat in x_cats:
+            #     for y_cat in y_cats:
+            #         xdf = df.loc[df["x"] == x_cat]
+            #         xydf = xdf.loc[xdf["y"] == y_cat]
+            #         table.loc[x_cat, y_cat] = len(xydf)
+            table = pd.crosstab(x, y)
+
+            # sum of overall non-modal frequency
+            y_sums = table.sum(axis=0)
+            e1 = y_sums.loc[y_sums != y_sums.max()].sum()
+
+            # sum of non-model frequency per independent variable
+            x_maxes = table.max(axis=1).sum()
+            e2 = table.sum().sum() - x_maxes
+            gk_lambda = min((e1 - e2) / e1, 0)
+
+            #! UNUSED, CRAMER'S
+            res_chi2 = chi2_contingency(table)
+
+            n = table.sum().sum()
+            min_dim = min(table.shape) - 1
+            cramers_v = np.sqrt(res_chi2.statistic / (n * min_dim))
+            #! UNUSED
+
+            if cramers_v > gk_lambda:
+                return StatResult(r"\phi _c", cramers_v, res_chi2.pvalue)
+            else:
+                return StatResult(r"\lambda", gk_lambda, None)
+
+        case BasicDataType.CONTINUOUS, BasicDataType.ORDINAL:
+            # kendalltau b
+            # can also be spearmanr
+
+            res_kw = kendalltau(x, y, variant="b", alternative="two-sided")
+            return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
+
+        case BasicDataType.NOMINAL, BasicDataType.ORDINAL:
+            # chi-square and cramer's v
+            contingency_table = pd.crosstab(x, y)
+            res = chi2_contingency(contingency_table)
+
+            n = contingency_table.sum().sum()
+            min_dim = min(contingency_table.shape) - 1
+
+            if min_dim == 0:
+                # No group
+                return None
+
+            cramers_v = np.sqrt(res.statistic / (n * min_dim))
+
+            return StatResult(r"\phi _c", cramers_v, res.pvalue)
+
+        case BasicDataType.CONTINUOUS, BasicDataType.NOMINAL:
+            # point biserial
+            # but probably will never encounter this?
+
+            pass
+
+    return None
 
 
 def plot_counts(
     df: pd.DataFrame,
-    dtype_dict: DataTypeDict,
     num_plots_x: int,
     num_plots_y: int,
 ):
-    fig, axes = plt.subplots(num_plots_y, num_plots_x, figsize=(12, 8))
+    dtype_dict = df.attrs["dtype_dict"]
+
+    fig, axes = plt.subplots(num_plots_y, num_plots_x, figsize=DEFAULT_FIGSIZE)
     fig.tight_layout()
     axes = axes.flatten()
 
-    for i, x in enumerate(df.columns.to_list()):
-        if dtype_dict[x].is_categorical():
-            filter_df = df[x].dropna().sort_values(ascending=True)
+    def _make_subplot(_i, _x):
+        if dtype_dict[_x].is_categorical():
+            filter_df = df[_x].dropna().sort_values(ascending=True)
 
-            sns.countplot(x=filter_df.astype(str), ax=axes[i])
+            sns.countplot(x=filter_df.astype(str), ax=axes[_i])
         else:
-            filter_df = df[x].dropna()
+            filter_df = df[_x].dropna()
             # TODO: replace with distribution
-            sns.violinplot(x=filter_df, ax=axes[i])
+            sns.violinplot(x=filter_df, ax=axes[_i])
+
+        return _x
+
+    # Create plots for each feature
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        x_cols = df.columns.to_list()
+        n = len(x_cols)
+        tq = tqdm(
+            executor.map(_make_subplot, range(n), x_cols),
+            total=n,
+            desc="Creating plots...",
+        )
+
+        for x in tq:
+            tq.set_description(f"Creating count plot: {x}")
 
     n_diff = num_plots_x * num_plots_y - len(df.columns)
     if n_diff:
         for i in range(n_diff):
             fig.delaxes(axes[-(i + 1)])
 
-    plt.suptitle("Feature Violin Plots")
+    # plt.suptitle("Feature Violin Plots")
     plt.subplots_adjust(hspace=0.5)
     plt.show(block=False)
+    dtype_dict = df.attrs["dtype_dict"]
 
 
-def plot_bivariate_violin(
+def tabulate_feature_corr(
     df: pd.DataFrame,
-    dtype_dict: DataTypeDict,
+    alpha: float = 0.05,
+):
+    dtype_dict = df.attrs["dtype_dict"]
+
+    cols = df.columns.to_list()
+    n = len(cols)
+    corr_df = pd.DataFrame(0.0, index=cols, columns=cols)
+
+    pairs = combinations(cols, 2)
+
+    for pair in pairs:
+        x, y = pair
+
+        filter_df = df[[x, y]].dropna()
+        resxy = find_corr(
+            filter_df[x],
+            filter_df[y],
+            dtype_dict[x].basic_type,
+            dtype_dict[y].basic_type,
+        )
+
+        resyx = find_corr(
+            filter_df[y],
+            filter_df[x],
+            dtype_dict[y].basic_type,
+            dtype_dict[x].basic_type,
+        )
+
+        if resxy:
+            corr_df.loc[x, y] = float(resxy.value)
+
+        if resyx:
+            corr_df.loc[y, x] = float(resyx.value)
+
+    # annot_df = np.vectorize(make_annot)(corr_df)
+
+    plt.figure(figsize=(8 + 2 * n, 4 + n))
+    sns.heatmap(
+        corr_df,
+        fmt=".4f",
+        annot=True,
+        cmap=DEFAULT_HEATMAP,
+        vmin=-1,
+        vmax=1,
+        mask=corr_df == 0,
+    )
+    plt.tick_params(
+        axis="x",
+        which="major",
+        labelbottom=False,
+        labeltop=True,
+        rotation=70,
+    )
+
+    plt.show()
+
+
+def plot_feature_label_corr(
+    df: pd.DataFrame,
     x_cols: list[str],
     y: str,
     num_plots_x: int,
     num_plots_y: int,
+    alpha: float = 0.05,
 ):
-    fig, axes = plt.subplots(num_plots_y, num_plots_x, figsize=(12, 8))
+    dtype_dict = df.attrs["dtype_dict"]
+
+    fig, axes = plt.subplots(num_plots_y, num_plots_x, figsize=DEFAULT_FIGSIZE)
     fig.tight_layout()
     axes = axes.flatten()
 
-    # Calculate expected value
-    if dtype_dict[y].is_categorical():
-        valc = df[[y]].value_counts()
-        freq_exp_frac = (valc / valc.sum()).to_numpy()
-    else:
-        freq_exp_frac = None
-
-    # Create plots for each feature -> label
-    for i, x in enumerate(x_cols):
-        filter_df = df[[x, y]].dropna()
+    # Made parallel
+    def _make_subplot(_i: int, _x: str):
+        filter_df = df[[_x, y]].dropna()
         filter_df.sort_values(by=y, ascending=False)
-        corr = None
 
-        x_dtype = dtype_dict[x].basic_type
+        x_dtype = dtype_dict[_x].basic_type
         y_dtype = dtype_dict[y].basic_type
 
-        if x_dtype.is_ordinal() and y_dtype.is_ordinal():
-            # Perform simple linear correlation
-            corrdf = filter_df.copy()
+        if x_dtype.is_categorical():
+            x_cats: NDArray = filter_df[_x].unique()
+            x_cats.sort()
 
-            if x_dtype.is_categorical():
-                x_cats: NDArray = filter_df[x].unique()
-                x_cats.sort()
+            order = x_cats.tolist()
+            plot_x = filter_df[_x].astype(str)
+            # corrdf[x] = pd.factorize(filter_df[x])[0]
+        else:
+            order = None
+            plot_x = filter_df[_x]
 
-                order = x_cats.tolist()
-                plot_x = filter_df[x].astype(str)
-                corrdf[x] = pd.factorize(filter_df[x])[0]
-            else:
-                order = None
-                plot_x = filter_df[x]
+        if y_dtype.is_categorical():
+            y_cats: NDArray = filter_df[y].unique()
+            y_cats.sort()
 
-            if y_dtype.is_categorical():
-                y_cats: NDArray = filter_df[y].unique()
-                y_cats.sort()
+            plot_y = filter_df[y].astype(str)
+            # corrdf[y] = pd.factorize(filter_df[y])[0]
+        else:
+            plot_y = filter_df[y]
 
-                plot_y = filter_df[y].astype(str)
-                corrdf[y] = pd.factorize(filter_df[y])[0]
-            else:
-                plot_y = filter_df[y]
+        sns.violinplot(
+            x=plot_x,
+            y=plot_y,
+            order=order,
+            ax=axes[_i],
+        )
 
-            sns.violinplot(
-                x=plot_x,
-                y=plot_y,
-                order=order,
-                ax=axes[i],
-            )
-
-            # Print linear correlation
-            corr = corrdf.corr()[x][y]
-            axes[i].text(
+        res = find_corr(filter_df[_x], filter_df[y], x_dtype, y_dtype)
+        if res:
+            axes[_i].text(
                 1.0,
                 1.0,
-                f"CORR: {round(corr, 4)}",
+                f"{res}",
                 ha="right",
                 va="top",
-                transform=axes[i].transAxes,
+                transform=axes[_i].transAxes,
                 bbox=dict(facecolor="white", alpha=0.5),
             )
-        else:
-            # Chi square
 
-            if x_dtype.is_categorical() and y_dtype.is_categorical():
-                x_cats: NDArray = filter_df[x].unique()
-                x_cats.sort()
+        axes[_i].invert_yaxis()
 
-                p_vals = []
-                for cat in x_cats.tolist():
-                    print("Current cat:", cat)
-                    freq_obs = filter_df.loc[filter_df[x] == cat, y].value_counts()
-                    freq_exp = freq_exp_frac * freq_obs.sum()
-                    p_val = chisquare(
-                        f_obs=freq_obs,
-                        f_exp=freq_exp,
-                    )
-                    print("got p_val", p_val)
-                    p_vals.append(p_val)
+        return _x
 
-                    # TODO: SKIP IF NOT ENOUGH OBSERVATIONS
+    # Create plots for each feature -> label
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        n = len(x_cols)
+        tq = tqdm(
+            executor.map(_make_subplot, range(n), x_cols),
+            total=n,
+            desc="Creating plots...",
+        )
 
-            else:
-                # this is default behavior, replace it
-                sns.violinplot(
-                    x=filter_df[x],
-                    y=filter_df[y].astype(str),
-                    ax=axes[i],
-                )
-
-        axes[i].invert_yaxis()
+        for x in tq:
+            tq.set_description(f"Creating plot: {x} -> {y}")
 
     n_diff = num_plots_x * num_plots_y - len(x_cols)
     if n_diff:
         for i in range(n_diff):
             fig.delaxes(axes[-(i + 1)])
 
-    plt.suptitle("Bivariate Violin Plots")
+    # plt.suptitle("Bivariate Violin Plots")
     plt.subplots_adjust(hspace=0.5)
     plt.show(block=False)
 

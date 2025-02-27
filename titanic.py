@@ -6,29 +6,20 @@ except ImportError:
     pass
 
 import os
-from functools import partial
 from math import log
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from sklearn.decomposition import PCA
-from sklearn.discriminant_analysis import (
-    LinearDiscriminantAnalysis,
-)
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
 
 from __scripts__.data import (
-    ColumnTransformer,
     DataFrameTransformer,
     DataType,
     FunctionInFunction,
     check_corr,
     clean_data,
-    do_pca,
+    ColumnTransformer,
 )
-from __scripts__.model import ModelParams, opt_base_model, tune_model
 
 load_dotenv(".env")
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -78,7 +69,7 @@ def get_ticket_number(ticket: str):
 
 F_Engg = DataFrameTransformer(
     [
-        (FunctionInFunction(extract_common_titles), "Name", "Title"),
+        # (FunctionInFunction(extract_common_titles), "Name", "Title"),
         (has_nickname, "Name", "HasNickname"),
         (has_other_name, "Name", "HasOthername"),
         (get_cabin_letter, "Cabin", "CabinLetter"),
@@ -86,6 +77,7 @@ F_Engg = DataFrameTransformer(
         (lambda ser: ser.sum(axis=1), ["SibSp", "Parch"], "FamilySize"),
         (lambda ser: ser == 0, ["FamilySize"], "IsAlone"),
         (lambda ser: ser.notna(), ["Cabin"], "HasCabin"),
+        ("drop", "TicketNo"),
     ]
 )
 
@@ -104,22 +96,21 @@ df = clean_data(
 
 
 dtype_dict = DataType.infer_df_dtype(df)
-dtype_dict.set_ordinal("Survived")
+# Perform modifications here
 
-check_corr(df, "Survived", dtype_dict, 4)
+check_corr(df, "Survived", 4)
 raise ValueError()
 
-X_trans, Y_trans, task = ColumnTransformer.create_transformers(
+Trans_X, Trans_Y, task = ColumnTransformer.create_transformers(
     df,
-    dtype_dict,
     labels="Survived",
 )
 
 
-X_scaled = X_trans.fit_transform(df, simple_imputer=SimpleImputer())
-Y_scaled = Y_trans.fit_transform(df)
+X_scaled = Trans_X.fit_transform(df, simple_imputer=SimpleImputer())
+Y_scaled = Trans_Y.fit_transform(df)
 
-do_pca(X_scaled, Y_scaled, X_trans, Y_trans, task=task)
+do_pca(X_scaled, Y_scaled, Trans_X, Trans_Y, task=task)
 
 raise ValueError()
 
@@ -157,7 +148,7 @@ raise ValueError()
 test_df = pd.read_csv("titanic/test.csv")
 test_df = F_Engg.transform(test_df)
 
-X_test_scaled = X_trans.transform(test_df)
+X_test_scaled = Trans_X.transform(test_df)
 Y_test_pred = best_mdl.predict(X_test_scaled)
 Y_test_pred = Y_test_pred.astype(int).ravel()
 

@@ -8,6 +8,7 @@ from typing import (
 )
 
 import pandas as pd
+from typing_extensions import override
 
 
 class BasicDataType(Enum):
@@ -17,6 +18,9 @@ class BasicDataType(Enum):
     CONTINUOUS = auto()
 
     def is_categorical(self):
+        return (self == BasicDataType.NOMINAL) or (self == BasicDataType.ORDINAL)
+
+    def is_discrete(self):
         return (self == BasicDataType.NOMINAL) or (self == BasicDataType.ORDINAL)
 
     def is_nominal(self):
@@ -68,6 +72,9 @@ class DataType(DataTypeElement, Enum):
 
     def is_categorical(self) -> bool:
         return self.basic_type.is_categorical()
+
+    def is_discrete(self):
+        return self.basic_type.is_discrete()
 
     def is_ordinal(self):
         return self.basic_type.is_ordinal()
@@ -141,10 +148,12 @@ class DataType(DataTypeElement, Enum):
         for k, v in dtype_dict.items():
             if v.is_categorical() and not v.is_ordinal():
                 logger.info(
-                    f"NOTE: Column '{k}' ({v.name}) has unknown ordinality. If the column is ordinal, set it by `dtype_dict['{k}'] = dtype_dict['{k}'].set_ordinal()`"
+                    f"NOTE: Column '{k}' ({v.name}) has unknown ordinality. If the column is ordinal, set it by `dtype_dict.set_ordinal('{k}')`"
                 )
 
-        return DataTypeDict(dtype_dict)
+        df.attrs = {"dtype_dict": DataTypeDict(dtype_dict)}
+
+        return df.attrs["dtype_dict"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -167,3 +176,39 @@ class Task:
     @staticmethod
     def clf_sl():
         return Task(False, "classification")
+
+
+@dataclass(slots=True, frozen=True)
+class StatResult:
+    symbol: str
+    value: float
+    pvalue: Optional[float]
+
+    @property
+    def strength(self):
+        abs_val = abs(self.value)
+
+        if abs_val < 0.1:
+            return "Negligible"
+        elif abs_val < 0.3:
+            return "Weak"
+        elif abs_val < 0.5:
+            return "Fair"
+        elif abs_val < 0.7:
+            return "Moderate"
+        elif abs_val < 1:
+            return "Very Strong"
+        elif abs_val == 1:
+            return "Perfect"
+
+    def __str__(self):
+        if self.pvalue:
+            pval = f"{self.pvalue:.1e}".replace("e", r"\mathrm{e}")
+
+            if self.pvalue < 0.05:
+                return f"${self.symbol}={self.value:.2f}, *p={pval}$"
+
+            return f"${self.symbol}={self.value:.2f}, p={pval}$"
+
+        else:
+            return f"${self.symbol}={self.value:.2f}$"

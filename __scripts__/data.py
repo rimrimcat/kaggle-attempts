@@ -1,9 +1,5 @@
 import logging
-from collections import UserDict
-from dataclasses import dataclass
-from enum import Enum, auto
 from math import ceil
-from types import MethodType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -25,10 +21,8 @@ try:
 except ImportError:
     pass
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 from numpy import float64
 from numpy.typing import NDArray
 from pandas.core.frame import DataFrame
@@ -47,14 +41,14 @@ from sklearn.preprocessing import (
 from sklearn.preprocessing._encoders import _BaseEncoder
 
 from __scripts__.plot import (
-    plot_bivariate_violin,
+    plot_feature_label_corr,
     plot_counts,
-    plot_monovariate_violin,
     plot_pca_loadings,
     plot_principal_components,
     plot_scree,
+    tabulate_feature_corr,
 )
-from __scripts__.types import BasicDataType, DataType, DataTypeDict, Task
+from __scripts__.typ import DataType, DataTypeDict, Task
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,6 +188,13 @@ class DataFrameTransformer:
                 out_cols = in_cols
 
             trans = tup[0]
+
+            if isinstance(trans, str) and trans == "drop":
+                if isinstance(in_cols, str):
+                    df.drop(columns=[in_cols], inplace=True)
+                elif isinstance(in_cols, list):
+                    df.drop(columns=in_cols, inplace=True)
+                continue
 
             if isinstance(in_cols, list) and len(in_cols) > 1:
                 output = trans(df[in_cols])
@@ -539,12 +540,15 @@ class ColumnTransformer(_ColumnTransformer):
     @staticmethod
     def create_transformers(
         df: pd.DataFrame,
-        dtype_dict: dict[str, DataType],
         labels: Union[str, list[str]],
         trans_dict: Optional[dict[str, Union[BaseEstimator, _BaseEncoder]]] = None,
+        dtype_dict: Optional[DataTypeDict] = None,
     ) -> tuple["ColumnTransformer", "ColumnTransformer", Task]:
         if isinstance(labels, str):
             labels = [labels]
+
+        if dtype_dict is None:
+            dtype_dict = df.attrs["dtype_dict"]
 
         task = Task(
             multi_label=True if len(labels) > 1 else False,
@@ -809,7 +813,6 @@ def clean_data(
 def check_corr(
     df: pd.DataFrame,
     label: str,
-    dtype_dict: dict[str, DataType],
     num_plots_x: int = 3,
 ):
     x_cols = df.columns.drop(label).to_list()
@@ -817,11 +820,10 @@ def check_corr(
 
     n_plots = len(x_cols)
 
-    plot_counts(df, dtype_dict, num_plots_x, ceil((n_plots + 1) / num_plots_x))
+    tabulate_feature_corr(df)
 
-    plot_bivariate_violin(
-        df, dtype_dict, x_cols, y, num_plots_x, ceil(n_plots / num_plots_x)
-    )
+    plot_counts(df, num_plots_x, ceil((n_plots + 1) / num_plots_x))
+    plot_feature_label_corr(df, x_cols, y, num_plots_x, ceil(n_plots / num_plots_x))
 
 
 def do_pca(
