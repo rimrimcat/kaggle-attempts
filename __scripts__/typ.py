@@ -8,6 +8,8 @@ from typing import (
 )
 
 import pandas as pd
+import numpy as np
+from pandas import Categorical
 from typing_extensions import override
 
 
@@ -70,6 +72,9 @@ class DataType(DataTypeElement, Enum):
     def __bool__(self):
         return not self.should_drop
 
+    def is_binary(self):
+        return self.name
+
     def is_categorical(self) -> bool:
         return self.basic_type.is_categorical()
 
@@ -100,7 +105,7 @@ class DataType(DataTypeElement, Enum):
         uniq_vals = ser.unique()
         n_uniq = len(uniq_vals)
 
-        # Get max categories
+        # get max categories
         if num_max_categories:
             max_categories = num_max_categories
         elif fraction_max_categories:
@@ -111,6 +116,7 @@ class DataType(DataTypeElement, Enum):
         if n_uniq == 1:
             return DataType.UNINFORMATIVE
 
+        # binary data types
         if n_uniq == 2:
             uniq_vals_set = set(uniq_vals.tolist())
             if uniq_vals_set == {True, False}:
@@ -120,17 +126,24 @@ class DataType(DataTypeElement, Enum):
 
             return DataType.CATEGORICAL_NOMINAL_BINARY
 
-        if "name" in title.lower() or "id" in title.lower() or n_uniq == n:
+        if "name" in title.lower() or title.lower() is "id" or n_uniq == n:
             return DataType.IDENTIFIER
 
+        # handle special case of pandas Categorical
+        if isinstance(uniq_vals, Categorical):
+            return DataType.CATEGORICAL_ORDINAL_BINARY
+
+        # differentiate between categorical string and uninformative
         if ser.apply(lambda x: isinstance(x, str)).all():
             if n_uniq <= max_categories:
                 return DataType.CATEGORICAL_NOMINAL_STRING
             else:
                 return DataType.UNINFORMATIVE
 
+        # differentiate between categorical int and continuous
         if (ser == ser.astype(int, errors="raise")).all():
-            if n_uniq <= max_categories:
+            uniq_vals.sort()
+            if n_uniq <= max_categories and (np.diff(uniq_vals) == 1).all():
                 return DataType.CATEGORICAL_INTEGER
             else:
                 return DataType.NUMERIC
@@ -160,6 +173,7 @@ class DataType(DataTypeElement, Enum):
 class Task:
     multi_label: bool
     task: Literal["regression", "classification"]
+    time_series: bool = False
 
     @staticmethod
     def reg_ml():

@@ -13,6 +13,8 @@ from typing import (
 )
 
 from missforest import MissForest
+from pandas import Categorical
+from sklearn.tree import DecisionTreeRegressor
 
 try:
     from sklearnex import patch_sklearn
@@ -39,6 +41,7 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 from sklearn.preprocessing._encoders import _BaseEncoder
+from string import ascii_uppercase
 
 from __scripts__.plot import (
     plot_feature_label_corr,
@@ -82,12 +85,14 @@ transform_list: TypeAlias = list[
 dft_fcn_col: TypeAlias = Callable[[Any], Any]
 dft_fcn_cols: TypeAlias = Callable[[pd.Series], Any]
 dft_fcn_colmany: TypeAlias = Callable[[pd.DataFrame], Any]
-df_transform_list: TypeAlias = Sequence[
+df_transform_list: TypeAlias = list[
     Union[
+        tuple[Literal["drop"], str],
         tuple[dft_fcn_col, str],
         tuple[dft_fcn_col, str, str],
         tuple[Union[dft_fcn_cols, dft_fcn_colmany], list[str], str],
         tuple[Union[dft_fcn_cols, dft_fcn_colmany], list[str], list[str]],
+        tuple[Union[dft_fcn_cols, dft_fcn_colmany], list[str], list[str], list[str]],
     ]
 ]
 
@@ -162,32 +167,100 @@ class FunctionInFunction:
         return self.inner_f(X)
 
 
+class GroupAutoSplitter:
+    def __init__(
+        self,
+        max_groups: int = 3,
+        group_names: Optional[list[Any]] = None,
+        is_ordinal: bool = False,
+    ):
+        self.regr = DecisionTreeRegressor(max_leaf_nodes=max_groups)
+        self.group_names = group_names
+
+    # TODO: implement is_ordinal
+
+    def fit(self, X: pd.DataFrame):
+        if len(X.columns) != 2:
+            raise ValueError(f"Expected two columns, got {len(X.columns)}")
+
+        self.regr.fit(
+            X.loc[:, X.columns[0]].to_numpy().reshape(-1, 1),
+            X.loc[:, X.columns[1]].to_numpy(),
+        )
+
+        threshold = self.regr.tree_.threshold
+
+        def make_splitter():
+            splits = sorted(threshold[threshold != -2])
+            if self.group_names:
+                group_names = self.group_names
+            else:
+                group_names = [x for x in ascii_uppercase[: len(splits) + 1]]
+
+            def splitter(x):
+                # propagate nans
+                if np.isnan(x):
+                    return x
+
+                for i, thresh in enumerate(splits):
+                    if x < thresh:
+                        return group_names[i]
+                else:
+                    return group_names[len(splits)]
+
+            return np.vectorize(splitter)
+            # return splitter
+
+        self.splitter = make_splitter()
+
+    def __call__(self, X: pd.Series):
+        # return X.apply(self.splitter)
+        return self.splitter(X)
+
+
 class DataFrameTransformer:
     transformers: df_transform_list
+    pending_fit: df_transform_list
 
     def __init__(
         self,
         transformers: df_transform_list,
     ) -> None:
         self.transformers = transformers
+        self.pending_fit = []
 
     def fit(self, df: pd.DataFrame):
         for tup in self.transformers:
             trans = tup[0]
 
             if hasattr(trans, "fit"):
-                trans.fit(df[tup[1]])
+                try:
+                    if len(tup) == 4:
+                        trans.fit(df[tup[1] + tup[3]])
+                    else:
+                        trans.fit(df[tup[1]])
+                except KeyError:
+                    self.pending_fit.append(tup)
 
     def transform(self, df: pd.DataFrame):
         for tup in self.transformers:
+            print("DEBUG:", tup)
             in_cols = tup[1]
 
-            if len(tup) == 3:
+            if len(tup) >= 3:
                 out_cols = tup[2]
             else:
                 out_cols = in_cols
 
             trans = tup[0]
+
+            if self.pending_fit:
+                if tup in self.pending_fit and hasattr(trans, "fit"):
+                    if len(tup) == 4:
+                        trans.fit(df[tup[1] + tup[3]])
+                    else:
+                        trans.fit(df[tup[1]])
+                    self.pending_fit.remove(tup)
 
             if isinstance(trans, str) and trans == "drop":
                 if isinstance(in_cols, str):
@@ -196,10 +269,12 @@ class DataFrameTransformer:
                     df.drop(columns=in_cols, inplace=True)
                 continue
 
-            if isinstance(in_cols, list) and len(in_cols) > 1:
+            # if isinstance(in_cols, list) and len(in_cols) > 1:
+            if isinstance(in_cols, list):
                 output = trans(df[in_cols])
             else:
                 output = df[in_cols].apply(trans)
+
             df[out_cols] = output
         return df
 
@@ -280,6 +355,8 @@ class ColumnTransformer(_ColumnTransformer):
         transform_then_impute=True,
         **fit_params,
     ) -> _X_t:
+        logger = logging.getLogger("data.ColumnTransformer.fit_transform")
+
         X_t = super().fit_transform(X, y, **fit_params)
 
         if missforest:
@@ -312,6 +389,7 @@ class ColumnTransformer(_ColumnTransformer):
                 mf, self.output_indices_, X_t
             )
 
+            logger.info("Fitting MissForest imputer, this might take a while...")
             X_t = self._imputer.fit_transform(X_t)
 
         elif simple_imputer:
@@ -543,12 +621,14 @@ class ColumnTransformer(_ColumnTransformer):
         labels: Union[str, list[str]],
         trans_dict: Optional[dict[str, Union[BaseEstimator, _BaseEncoder]]] = None,
         dtype_dict: Optional[DataTypeDict] = None,
+        time_series: bool = False,
     ) -> tuple["ColumnTransformer", "ColumnTransformer", Task]:
         if isinstance(labels, str):
             labels = [labels]
 
         if dtype_dict is None:
             dtype_dict = df.attrs["dtype_dict"]
+
 
         task = Task(
             multi_label=True if len(labels) > 1 else False,
@@ -557,6 +637,7 @@ class ColumnTransformer(_ColumnTransformer):
                 if dtype_dict[labels[0]].is_categorical()
                 else "regression"
             ),
+            time_series=time_series,
         )
 
         x_cols = [col for col in df.columns if col not in labels]
@@ -609,7 +690,8 @@ def summarize_data(df: pd.DataFrame, print_summary: bool = True):
         data_types.append(dtype)
 
         unique_values = df[col].dropna().unique()
-        unique_values.sort()
+        if not isinstance(unique_values, Categorical):
+            unique_values.sort()
         uv = unique_values.tolist()
         value = ""
         match dtype:
@@ -693,6 +775,7 @@ def clean_data(
     drop_uninformative: bool = True,
     drop_missing_rows: bool = False,
     add_new_features: bool = False,
+    print_data: bool = True,
 ) -> DataFrame:
     """Cleans the dataframe by removing columns with unknown data types.
 
@@ -773,27 +856,28 @@ def clean_data(
             ]
             mod_data_types_df.index = new_indices
 
-        print("=#=#=#=#=#=#=#=#= SUMMARY =#=#=#=#=#=#=#=#=")
+        if print_data:
+            print("=#=#=#=#=#=#=#=#= SUMMARY =#=#=#=#=#=#=#=#=")
 
-        print("=== SIZE ===")
-        print(f"{summary_0['n_cols']} -> {summary_2['n_cols']} columns")
-        print(f"{summary_0['n_rows']} -> {summary_2['n_rows']} rows")
-        print("")
+            print("=== SIZE ===")
+            print(f"{summary_0['n_cols']} -> {summary_2['n_cols']} columns")
+            print(f"{summary_0['n_rows']} -> {summary_2['n_rows']} rows")
+            print("")
 
-        print("=== INCOMPLETENESS ===")
-        nan_col_str = f": {summary_2['nan_cols']}" if summary_2["nan_cols"] else ""
-        print(
-            f"{len(summary_0['nan_cols'])} -> {len(summary_2['nan_cols'])} columns containing NaNs{nan_col_str}"
-        )
-        print(
-            f"{summary_0['nan_rows']} -> {summary_2['nan_rows']} rows containing NaNs"
-        )
-        print(f"{summary_0['nans']} -> {summary_2['nans']} total NaNs")
-        print("")
+            print("=== INCOMPLETENESS ===")
+            nan_col_str = f": {summary_2['nan_cols']}" if summary_2["nan_cols"] else ""
+            print(
+                f"{len(summary_0['nan_cols'])} -> {len(summary_2['nan_cols'])} columns containing NaNs{nan_col_str}"
+            )
+            print(
+                f"{summary_0['nan_rows']} -> {summary_2['nan_rows']} rows containing NaNs"
+            )
+            print(f"{summary_0['nans']} -> {summary_2['nans']} total NaNs")
+            print("")
 
-        print("=== DATA TYPES ===")
-        print(summary_1["data_types_df"].to_string())
-        print("")
+            print("=== DATA TYPES ===")
+            print(summary_1["data_types_df"].to_string())
+            print("")
 
     if summary_2["nans"]:
         logger.info(

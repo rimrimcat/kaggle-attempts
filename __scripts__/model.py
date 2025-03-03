@@ -8,7 +8,7 @@ except ImportError:
 from enum import Enum, auto
 from math import ceil
 from pprint import pprint
-from typing import Callable, Optional, Type, Union
+from typing import Callable, List, Optional, Tuple, Type, Union
 
 import joblib
 import numpy as np
@@ -17,7 +17,7 @@ import pandas as pd
 from optuna import Trial
 from optuna.pruners import HyperbandPruner
 from optuna.samplers import TPESampler
-from sklearn.base import ClassifierMixin, RegressorMixin
+from sklearn.base import ClassifierMixin, RegressorMixin, clone
 from sklearn.covariance import OAS
 from sklearn.discriminant_analysis import (
     LinearDiscriminantAnalysis,
@@ -40,13 +40,22 @@ from sklearn.ensemble import (
     VotingRegressor,
 )
 from sklearn.gaussian_process import GaussianProcessClassifier, GaussianProcessRegressor
-from sklearn.metrics import make_scorer, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    make_scorer,
+    mean_squared_error,
+    roc_auc_score,
+)
 from sklearn.model_selection import KFold, cross_val_score
 from sklearn.naive_bayes import BernoulliNB, GaussianNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sktime.forecasting.model_selection import SlidingWindowSplitter
+from sktime.split import ExpandingSlidingWindowSplitter
+from tqdm import tqdm
 
+from __scripts__.cross_val import CombinatorialPurgedKFold
 from __scripts__.data import Task
 
 
@@ -345,33 +354,163 @@ class ModelParams:
         }
 
 
+def min_of_mean_median(scores: list[float]):
+    return np.min([np.mean(scores), np.median(scores)])
+
+
+def kfold_cv_iter(
+    model,
+    X,
+    Y,
+    scoring,
+    overall_scoring=min_of_mean_median,
+    n_splits: int = 5,
+    shuffle: bool = True,
+):
+    kf = KFold(n_splits=n_splits, shuffle=shuffle)
+
+    scores = []
+    for step, (train_idx, test_idx) in enumerate(kf.split(X)):
+        # Split data for this fold
+        X_train, X_test = X[train_idx], X[test_idx]
+        Y_train, Y_test = Y[train_idx], Y[test_idx]
+
+        # Train model
+        model.fit(X_train, Y_train)
+
+        # Get score for this fold
+        fold_score = scoring(model, X_test, Y_test)
+        scores.append(fold_score)
+
+        yield (step, overall_scoring(scores))
+
+
+def kfold_cv(
+    model,
+    X,
+    Y,
+    scoring,
+    overall_scoring=min_of_mean_median,
+    n_splits: int = 5,
+    shuffle: bool = True,
+    iterate: bool = False,
+):
+    kf = KFold(n_splits=n_splits, shuffle=shuffle)
+    cv_scores = cross_val_score(model, X, Y, scoring=scoring, cv=kf)
+    return overall_scoring(cv_scores)
+
+
+def comb_purged_kfold_cv_iter(
+    model,
+    X,
+    Y,
+    scoring,
+    overall_scoring=min_of_mean_median,
+    n_splits: int = 5,
+    shuffle: bool = True,
+):
+    cpcv = CombinatorialPurgedKFold(
+        n_groups=int(X.shape[0] / 150),
+        test_groups=2,
+        frac_embargo=0.01,
+    )
+    scores = []
+    for step, (train_idx, test_idx) in enumerate(cpcv.split(X)):
+        # Split data for this fold
+
+        X_train, X_test = X[train_idx], X[test_idx]
+        Y_train, Y_test = Y[train_idx], Y[test_idx]
+
+        # Train model
+        model.fit(X_train, Y_train)
+
+        # Get score for this fold
+        fold_score = scoring(model, X_test, Y_test)
+        scores.append(fold_score)
+
+        yield (step, overall_scoring(scores))
+
+
+def comb_purged_kfold_cv(
+    model,
+    X,
+    Y,
+    scoring,
+    overall_scoring=min_of_mean_median,
+    n_splits: int = 5,
+    shuffle: bool = True,
+):
+    cpcv = CombinatorialPurgedKFold(
+        n_groups=int(X.shape[0] / 150),
+        test_groups=2,
+        frac_embargo=0.01,
+    )
+    splits = cpcv.split(X)
+    print("Got splits:", splits)
+    cv_scores = cross_val_score(model, X, Y, scoring=scoring, cv=splits)
+    return overall_scoring(cv_scores)
+
+
 def opt_base_model(X, Y, task: Task, do_cv: bool = True):
     match task.task:
         case "regression":
             model_list = BASE_REGRESSORS
-            raise NotImplementedError()
+            scorer = make_scorer(mean_squared_error, greater_is_better=False)
         case "classification":
             model_list = BASE_CLASSIFIERS
-            scorer = make_scorer(roc_auc_score)
+            # scorer = make_scorer(roc_auc_score)
+            scorer = make_scorer(accuracy_score)
 
     if not task.multi_label:
         Y = Y.ravel()
 
-    scores = []
-    for model in model_list:
-        print("Evaluating model:", type(model).__qualname__)
-        if do_cv:
-            kf = KFold(n_splits=5, shuffle=True)
-            cv_scores = cross_val_score(model, X, Y, scoring=scorer, cv=kf)
-            scores.append(np.min([np.mean(cv_scores), np.median(cv_scores)]))
-        else:
+    overall_scores = []
+
+    if task.time_series and do_cv:
+
+        def train_test_model(model):
+            overall_scores.append(comb_purged_kfold_cv(model, X, Y, scorer))
+
+    elif do_cv:
+
+        def train_test_model(model):
+            overall_scores.append(kfold_cv(model, X, Y, scorer))
+
+    else:
+
+        def train_test_model(model):
             model.fit(X, Y)
-            scores.append(model.score(X, Y))
+            overall_scores.append(model.score(X, Y))
+
+    tq = tqdm(model_list, desc="Evaluating models...")
+    for i, model in enumerate(tq):
+        if i == 0:
+            prev_model = ""
+            tq.set_description(f"{type(model).__qualname__}: evaluating...")
+        else:
+            tq.set_description(
+                f"{prev_model}: {overall_scores[i-1]:.4f} |  {type(model).__qualname__}: evaluating.."
+            )
+
+        train_test_model(model)
+
+        prev_model = type(model).__qualname__
+
+    # for model in model_list:
+    #     print("Evaluating model:", type(model).__qualname__)
+
+    #     if task.time_series and do_cv:
+    #         overall_scores.append(comb_purged_kfold_cv(model, X, Y, scorer))
+    #     elif do_cv:
+    #         overall_scores.append(kfold_cv(model, X, Y, scorer))
+    #     else:
+    #         model.fit(X, Y)
+    #         overall_scores.append(model.score(X, Y))
 
     trial_df = pd.DataFrame(
         {
             "model": [type(model).__qualname__ for model in model_list],
-            "score": scores,
+            "score": overall_scores,
             "model_index": range(len(model_list)),
         }
     )
@@ -380,7 +519,10 @@ def opt_base_model(X, Y, task: Task, do_cv: bool = True):
     trial_df.reset_index(drop=True, inplace=True)
     print(trial_df[["model", "score"]])
 
-    return model_list[trial_df.loc[0, "model_index"]]
+    best_mdl = model_list[trial_df.loc[0, "model_index"]]
+    best_mdl.fit(X, Y)
+
+    return best_mdl
 
 
 def tune_model(
@@ -408,30 +550,13 @@ def tune_model(
     def model_search_objective(trial: optuna.Trial):
         model = model_cls(**param_func(trial))
 
-        kf = KFold(n_splits=5, shuffle=True)
-        # scores = cross_val_score(model, X, Y, scoring=scorer, cv=kf)
-
-        scores = []
-        for step, (train_idx, test_idx) in enumerate(kf.split(X)):
-            # Split data for this fold
-            X_train, X_test = X[train_idx], X[test_idx]
-            Y_train, Y_test = Y[train_idx], Y[test_idx]
-
-            # Train model
-            model.fit(X_train, Y_train)
-
-            # Get score for this fold
-            fold_score = scorer(model, X_test, Y_test)
-            scores.append(fold_score)
-
-            score_so_far = np.min([np.mean(scores), np.median(scores)])
-
-            trial.report(score_so_far, step)
+        for step, score in kfold_cv_iter(model, X, Y, scorer):
+            trial.report(score, step)
 
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-        return score_so_far
+        return score
 
     def optimize_study(study_name: str, n_trials):
         study = optuna.create_study(

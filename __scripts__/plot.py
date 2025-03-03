@@ -1,5 +1,6 @@
 from concurrent.futures.thread import ThreadPoolExecutor
 from itertools import combinations
+from math import ceil
 from typing import (
     Any,
     Optional,
@@ -13,26 +14,34 @@ import pandas as pd
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap, hex2color, rgb2hex
 from numpy.typing import NDArray
+from pandas import Categorical
 from scipy.stats import (
+    chi2_contingency,
+    chisquare,
     kendalltau,
     kruskal,
     spearmanr,
-    chi2_contingency,
-    chisquare,
 )
 from sklearn.decomposition import PCA
 from tqdm import tqdm
 
 from __scripts__.typ import BasicDataType, StatResult
 
-DEFAULT_FIGSIZE = (30, 16)
+DEFAULT_FIGSIZE = (32, 18)
 DEFAULT_FONTSIZE = 24  # TODO: IMPLEMENT
 DEFAULT_COLOR_LIST = ["red", "orange", "blue", "green"]
 DEFAULT_HEATMAP = LinearSegmentedColormap.from_list(
     "correlation", colors=["#4e0707", "#ffffff", "#000435"]
 )
 
-plt.rcParams.update({"font.size": DEFAULT_FONTSIZE})
+plt.rcParams.update(
+    {
+        "font.size": DEFAULT_FONTSIZE,
+        "axes.titlesize": DEFAULT_FONTSIZE,
+        "axes.labelsize": DEFAULT_FONTSIZE,
+    }
+)
+# sns.set_context("paper", rc={"font.size":DEFAULT_FONTSIZE,"axes.titlesize":8,"axes.labelsize":5})
 
 
 def assign_colors(class_list: Sequence[Any], color_list=None):
@@ -85,11 +94,13 @@ def find_corr(
 ):
     if x_type.is_categorical():
         x_cats = x.unique()
-        x_cats.sort()
+        if not isinstance(x_cats, Categorical):
+            x_cats.sort()
 
     if y_type.is_categorical():
         y_cats = y.unique()
-        y_cats.sort()
+        if not isinstance(y_cats, Categorical):
+            y_cats.sort()
 
     match x_type, y_type:
         # Main reference is doi:10.1177/8756479308317006
@@ -283,52 +294,131 @@ def tabulate_feature_corr(
 
 def plot_feature_label_corr(
     df: pd.DataFrame,
-    x_cols: list[str],
     y: str,
-    num_plots_x: int,
-    num_plots_y: int,
+    x_cols: Optional[list[str]] = None,
+    num_plots_x: int = 4,
+    num_plots_y: Optional[int] = None,
     alpha: float = 0.05,
 ):
+
+    if not x_cols:
+        x_cols = df.columns.drop(y).to_list()
+
+    if not num_plots_y:
+        num_plots_y = ceil(len(x_cols) / num_plots_x)
+
     dtype_dict = df.attrs["dtype_dict"]
 
-    fig, axes = plt.subplots(num_plots_y, num_plots_x, figsize=DEFAULT_FIGSIZE)
+    fig, axes = plt.subplots(
+        num_plots_y,
+        num_plots_x,
+        figsize=DEFAULT_FIGSIZE,
+    )
     fig.tight_layout()
     axes = axes.flatten()
 
     # Made parallel
     def _make_subplot(_i: int, _x: str):
         filter_df = df[[_x, y]].dropna()
-        filter_df.sort_values(by=y, ascending=False)
+        filter_df.sort_values(by=[y, _x], ascending=False, inplace=True)
 
         x_dtype = dtype_dict[_x].basic_type
         y_dtype = dtype_dict[y].basic_type
 
         if x_dtype.is_categorical():
             x_cats: NDArray = filter_df[_x].unique()
-            x_cats.sort()
+            if not isinstance(x_cats, Categorical):
+                x_cats.sort()
 
             order = x_cats.tolist()
             plot_x = filter_df[_x].astype(str)
-            # corrdf[x] = pd.factorize(filter_df[x])[0]
         else:
             order = None
             plot_x = filter_df[_x]
 
         if y_dtype.is_categorical():
             y_cats: NDArray = filter_df[y].unique()
-            y_cats.sort()
+            if not isinstance(y_cats, Categorical):
+                y_cats.sort()
 
             plot_y = filter_df[y].astype(str)
-            # corrdf[y] = pd.factorize(filter_df[y])[0]
         else:
             plot_y = filter_df[y]
 
-        sns.violinplot(
-            x=plot_x,
-            y=plot_y,
-            order=order,
-            ax=axes[_i],
-        )
+        if x_dtype.is_continuous() and y_dtype.is_categorical():
+            sns.violinplot(
+                x=plot_x,
+                y=plot_y,
+                order=order,
+                ax=axes[_i],
+            )
+        elif x_dtype.is_categorical and y_dtype.is_categorical():
+            table = pd.crosstab(
+                index=filter_df[y],
+                columns=filter_df[_x],
+            )
+            table.sort_index(axis="index", ascending=False, inplace=True)
+
+            tab = axes[_i].table(
+                cellText=table.astype(str).to_numpy().tolist()
+                + [[f"{__txt}" for __txt in table.columns.tolist()]],
+                cellLoc="center",
+                rowLoc="right",
+                bbox=[0.1, 0, 0.9, 0.8],
+                rowLabels=[f"{__txt}  " for __txt in table.index.tolist()] + [""],
+            )
+            tab.auto_set_font_size(False)
+            tab.set_fontsize(DEFAULT_FONTSIZE)
+
+            # plt.tick_params(
+            #     axis="x",
+            #     which="major",
+            #     labelbottom=False,
+            #     labeltop=True,
+            #     rotation=70,
+            # )
+            # axes[_i].tick_params(
+            #
+            #     rotation=70,
+            # )
+
+            axes[_i].set_xlabel(_x)
+            axes[_i].set_ylabel(y)
+
+            axes[_i].set_xticks([])
+            axes[_i].set_yticks([])
+
+            axes[_i].spines["top"].set_visible(False)
+            axes[_i].spines["right"].set_visible(False)
+            axes[_i].spines["left"].set_visible(False)
+            axes[_i].spines["bottom"].set_visible(False)
+
+            for key, cell in tab.get_celld().items():
+                cell.set_linewidth(0)
+
+            for i__ in range(len(y_cats)):
+                for j__ in range(len(x_cats)):
+                    data_cell = tab[(i__, j__)]
+                    data_cell.set_linewidth(1.5)
+
+            cat_lengths = []
+            for j__ in range(len(x_cats)):
+                data_cell = tab[(len(y_cats), j__)]
+                data_text = data_cell.get_text().get_text()
+                cat_lengths.append(len(data_text))
+
+            if max(cat_lengths) > DEFAULT_FONTSIZE / len(x_cats):
+                new_max_len = DEFAULT_FONTSIZE / len(x_cats)
+                new_font_size = new_max_len * len(x_cats) / 2
+                for j__ in range(len(x_cats)):
+                    data_cell = tab[(len(y_cats), j__)]
+                    data_cell.set_text_props(
+                        rotation=-60,
+                        fontsize=new_font_size,
+                    )
+
+        else:
+            raise NotImplementedError()
 
         res = find_corr(filter_df[_x], filter_df[y], x_dtype, y_dtype)
         if res:
@@ -341,8 +431,6 @@ def plot_feature_label_corr(
                 transform=axes[_i].transAxes,
                 bbox=dict(facecolor="white", alpha=0.5),
             )
-
-        axes[_i].invert_yaxis()
 
         return _x
 
@@ -397,6 +485,8 @@ def plot_scree(
     else:
         x = [str(i) for i in range(1, n_components + 1)]
         y = explained_variance_ratio
+
+    fig = plt.figure(figsize=DEFAULT_FIGSIZE)
 
     # Bar Plot
     sns.barplot(
@@ -472,7 +562,7 @@ def plot_principal_components(
 
     if not pc3:
         # 2D
-        fig = plt.figure(figsize=(10, 6))
+        fig = plt.figure(figsize=DEFAULT_FIGSIZE)
         ax = fig.add_subplot(111)
 
         if classes is not None and classes.shape[1] == 1:
@@ -512,7 +602,7 @@ def plot_pca_loadings(
     if not feature_names:
         feature_names = [str(i + 1) for i in range(len(components))]
 
-    fig = plt.figure(figsize=(10, 6))
+    fig = plt.figure(figsize=DEFAULT_FIGSIZE)
     ax = fig.add_subplot(111)
     for i in range(components.shape[0]):
         pc1 = components[i, 0]
@@ -550,3 +640,7 @@ def plot_pca_loadings(
     ax.axhline(0, color="black", linewidth=0.8)
     ax.axvline(0, color="black", linewidth=0.8)
     plt.show(block=False)
+
+def plot_ts(X, y):
+    # TODO: plot time series for visualization
+    pass
