@@ -86,7 +86,7 @@ class PurgedKFold(_BaseKFold):
             # print("")
             # print("Train:", get_ranges(train_indices))
             # print("Test:", get_ranges(test_indices))
-            yield train_indices, test_indices
+            yield train_indices.astype(int), test_indices.astype(int)
 
 
 class CombinatorialPurgedKFold(_BaseKFold):
@@ -206,4 +206,4 @@ class CombinatorialPurgedKFold(_BaseKFold):
 
             # print("Test", get_ranges(test_indices))
             # print("Train:", get_ranges(train_indices))
-            yield train_indices, test_indices
+            yield train_indices.astype(int), test_indices.astype(int)

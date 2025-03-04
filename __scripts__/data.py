@@ -23,6 +23,8 @@ try:
 except ImportError:
     pass
 
+from string import ascii_uppercase
+
 import numpy as np
 import pandas as pd
 from numpy import float64
@@ -41,11 +43,10 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 from sklearn.preprocessing._encoders import _BaseEncoder
-from string import ascii_uppercase
 
 from __scripts__.plot import (
-    plot_feature_label_corr,
     plot_counts,
+    plot_feature_label_corr,
     plot_pca_loadings,
     plot_principal_components,
     plot_scree,
@@ -110,18 +111,18 @@ def onehot_to_ordinal(X):
     )
 
 
-def onehot_to_ordinal_new(X: NDArray):
-    n_rows, _ = X.shape
+# def onehot_to_ordinal_new(X: NDArray):
+#     n_rows, _ = X.shape
 
-    result = np.full(n_rows, np.nan)
+#     result = np.full(n_rows, np.nan)
 
-    for i in range(n_rows):
-        ones_indices = np.where(X[i] == 1)[0]
+#     for i in range(n_rows):
+#         ones_indices = np.where(X[i] == 1)[0]
 
-        if len(ones_indices) == 1:
-            result[i] = ones_indices[0]
+#         if len(ones_indices) == 1:
+#             result[i] = ones_indices[0]
 
-    return result.reshape(-1, 1)
+#     return result.reshape(-1, 1)
 
 
 def make_matrix_to_df(col_names: list[str]):
@@ -465,7 +466,7 @@ class ColumnTransformer(_ColumnTransformer):
                         [col],
                     )
                 )
-            elif not dtype.is_ordinal():
+            elif dtype.is_categorical() and not dtype.is_ordinal():
                 categories = df[col].dropna().unique()
                 transformers.append(
                     (
@@ -477,6 +478,9 @@ class ColumnTransformer(_ColumnTransformer):
                         [col],
                     )
                 )
+            else:
+                # Drop others
+                transformers.append((col, "drop", [col]))
 
         return ColumnTransformer(transformers=transformers)
 
@@ -558,9 +562,14 @@ class ColumnTransformer(_ColumnTransformer):
         output_ind_dict: dict[str, slice],
         X_t: _X_t,
     ):
+        logger = logging.getLogger(
+            "model.ColumnTransform._create_column_simple_imputer"
+        )
+
         transformers: transform_list = []
 
         for col, _slice in output_ind_dict.items():
+
             if col == "remainder":
                 continue
 
@@ -570,15 +579,13 @@ class ColumnTransformer(_ColumnTransformer):
             elif "remainder" in trans_dict:
                 fcn = trans_dict["remainder"]
             else:
-                logger = logging.getLogger(
-                    "model.ColumnTransform._create_column_imputer"
-                )
                 logger.info(
                     "NOTE: 'remainder' not specified. Defaulting to 'passthrough'."
                 )
 
             # Check if multiple slice
             slice_len = _slice.stop - _slice.start
+
             if slice_len > 1:
                 # OneHotEncoded value
                 X_slice = X_t[:, _slice]
@@ -602,7 +609,7 @@ class ColumnTransformer(_ColumnTransformer):
                         _slice,
                     )
                 )
-            else:
+            elif slice_len == 1:
                 transformers.append(
                     (
                         col,
@@ -610,7 +617,9 @@ class ColumnTransformer(_ColumnTransformer):
                         _slice,
                     )
                 )
-
+            else:
+                # Skip dropped cols
+                pass
         return _ColumnTransformer(
             transformers=transformers
         )  # does not have inverse transform
@@ -621,24 +630,12 @@ class ColumnTransformer(_ColumnTransformer):
         labels: Union[str, list[str]],
         trans_dict: Optional[dict[str, Union[BaseEstimator, _BaseEncoder]]] = None,
         dtype_dict: Optional[DataTypeDict] = None,
-        time_series: bool = False,
-    ) -> tuple["ColumnTransformer", "ColumnTransformer", Task]:
+    ) -> tuple["ColumnTransformer", "ColumnTransformer"]:
         if isinstance(labels, str):
             labels = [labels]
 
         if dtype_dict is None:
             dtype_dict = df.attrs["dtype_dict"]
-
-
-        task = Task(
-            multi_label=True if len(labels) > 1 else False,
-            task=(
-                "classification"
-                if dtype_dict[labels[0]].is_categorical()
-                else "regression"
-            ),
-            time_series=time_series,
-        )
 
         x_cols = [col for col in df.columns if col not in labels]
         df_X = df[x_cols]
@@ -654,7 +651,7 @@ class ColumnTransformer(_ColumnTransformer):
         trans_X._dtype_dict = dtype_dict
         trans_Y._dtype_dict = dtype_dict
 
-        return (trans_X, trans_Y, task)
+        return (trans_X, trans_Y)
 
 
 def summarize_data(df: pd.DataFrame, print_summary: bool = True):
@@ -690,7 +687,8 @@ def summarize_data(df: pd.DataFrame, print_summary: bool = True):
         data_types.append(dtype)
 
         unique_values = df[col].dropna().unique()
-        if not isinstance(unique_values, Categorical):
+        # if not isinstance(unique_values, Categorical):
+        if dtype not in [DataType.CATEGORICAL_ORDINAL_STRING, DataType.TIME_DATA]:
             unique_values.sort()
         uv = unique_values.tolist()
         value = ""

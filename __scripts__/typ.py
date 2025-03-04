@@ -5,11 +5,14 @@ from enum import Enum, auto
 from typing import (
     Literal,
     Optional,
+    Union,
 )
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from numpy.matlib import datetime64
 from pandas import Categorical
+from sklearn.metrics import accuracy_score, make_scorer, mean_squared_error
 from typing_extensions import override
 
 
@@ -51,6 +54,7 @@ class DataType(DataTypeElement, Enum):
     IDENTIFIER = auto(), True, BasicDataType.OTHER
     UNINFORMATIVE = auto(), True, BasicDataType.OTHER
     UNKNOWN = auto(), True, BasicDataType.OTHER
+    TIME_DATA = auto(), False, BasicDataType.OTHER
 
     CATEGORICAL_NOMINAL_BINARY = auto(), False, BasicDataType.NOMINAL
     CATEGORICAL_ORDINAL_BINARY = auto(), False, BasicDataType.ORDINAL
@@ -73,7 +77,7 @@ class DataType(DataTypeElement, Enum):
         return not self.should_drop
 
     def is_binary(self):
-        return self.name
+        return "BINARY" in self.name
 
     def is_categorical(self) -> bool:
         return self.basic_type.is_categorical()
@@ -100,6 +104,11 @@ class DataType(DataTypeElement, Enum):
         fraction_max_categories: Optional[float] = None,
     ) -> "DataType":
         ser = ser.dropna()
+
+        # detect unsortable datetime object
+        if pd.api.types.is_datetime64_any_dtype(ser.dtype):
+            return DataType.TIME_DATA
+
         title = str(ser.name)
         n = len(ser)
         uniq_vals = ser.unique()
@@ -126,7 +135,7 @@ class DataType(DataTypeElement, Enum):
 
             return DataType.CATEGORICAL_NOMINAL_BINARY
 
-        if "name" in title.lower() or title.lower() is "id" or n_uniq == n:
+        if "name" in title.lower() or title.lower() == "id" or n_uniq == n:
             return DataType.IDENTIFIER
 
         # handle special case of pandas Categorical
@@ -174,13 +183,46 @@ class Task:
     multi_label: bool
     task: Literal["regression", "classification"]
     time_series: bool = False
+    labels: Optional[list[str]] = None
+
+    def get_scorer(self):
+        match self.task:
+            case "regression":
+                return make_scorer(mean_squared_error, greater_is_better=False)
+            case "classification":
+                return make_scorer(accuracy_score)
+        raise NotImplementedError(f"Unknown task {self.task}")
 
     @staticmethod
-    def reg_ml():
+    def infer_from_df(df: pd.DataFrame, labels: Union[str, list[str]]):
+        dtype_dict = df.attrs["dtype_dict"]
+
+        if isinstance(labels, str):
+            labels = [labels]
+
+        # Check if there is a column with time_series
+
+        return Task(
+            multi_label=True if len(labels) > 1 else False,
+            task=(
+                "classification"
+                if dtype_dict[labels[0]].is_categorical()
+                else "regression"
+            ),
+            time_series=(
+                True
+                if any([dtype_dict[col] == DataType.TIME_DATA for col in df.columns])
+                else False
+            ),
+            labels=labels,
+        )
+
+    @staticmethod
+    def regr_ml():
         return Task(True, "regression")
 
     @staticmethod
-    def reg_sl():
+    def regr_sl():
         return Task(False, "regression")
 
     @staticmethod
