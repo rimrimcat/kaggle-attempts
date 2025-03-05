@@ -6,13 +6,28 @@ except ImportError:
     pass
 
 from IPython import get_ipython
+from lightgbm.sklearn import LGBMClassifier, LGBMRegressor
+from sklearn.linear_model import (
+    ElasticNet,
+    GammaRegressor,
+    HuberRegressor,
+    Lasso,
+    LinearRegression,
+    LogisticRegression,
+    PassiveAggressiveClassifier,
+    PassiveAggressiveRegressor,
+    PoissonRegressor,
+    Ridge,
+    SGDClassifier,
+    SGDRegressor,
+    TweedieRegressor,
+)
 
 if get_ipython() is None:
     from tqdm import tqdm
 else:
     # This fixes nested loops if in IPython
     from tqdm.notebook import tqdm
-
 
 from enum import Enum, auto
 from math import ceil
@@ -56,17 +71,28 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import KFold, cross_val_score
-from sklearn.naive_bayes import BernoulliNB, GaussianNB
+from sklearn.naive_bayes import BernoulliNB, ComplementNB, GaussianNB, MultinomialNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
-from sklearn.svm import SVC, SVR
+from sklearn.svm import SVC, SVR, LinearSVC, LinearSVR
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sktime.forecasting.model_selection import SlidingWindowSplitter
 from sktime.split import ExpandingSlidingWindowSplitter
-
+import logging
 from __scripts__.cross_val import CombinatorialPurgedKFold
 from __scripts__.data import Task
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(name)s %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+
+# mute the matplotlib logger
+matplotlib_logger = logging.getLogger("matplotlib.category")
+matplotlib_logger.setLevel(logging.WARN)
+lightgbm_logger = logging.getLogger("lightgbm")
+lightgbm_logger.setLevel(logging.WARN)
 
 def base_est_regressor():
     return [
@@ -128,7 +154,9 @@ class ModelClassElement:
 
 
 class ModelClass(ModelClassElement, Enum):
+
     # trunk-ignore-all(mypy/var-annotated)
+    # Classification Models
     RF_CLF = auto(), RandomForestClassifier, {}, Task.clf_sl(), False
     MLP_CLF = auto(), MLPClassifier, {"max_iter": 2000}, Task.clf_ml(), True
     LDA = auto(), LinearDiscriminantAnalysis, {}, Task.clf_sl(), False
@@ -159,7 +187,73 @@ class ModelClass(ModelClassElement, Enum):
         Task.clf_sl(),
         False,
     )
+    # New Classification Models
+    LOGISTIC_REGRESSION = (
+        auto(),
+        LogisticRegression,
+        {"max_iter": 2000, "solver": "lbfgs"},
+        Task.clf_sl(),
+        True,
+    )
+    DECISION_TREE_CLF = auto(), DecisionTreeClassifier, {}, Task.clf_sl(), False
+    SVC = auto(), SVC, {"kernel": "rbf", "max_iter": 2000}, Task.clf_sl(), False
+    LINEAR_SVC = (
+        auto(),
+        LinearSVC,
+        {"max_iter": 2000, "dual": "auto"},
+        Task.clf_sl(),
+        False,
+    )
+    # MULTINOMIAL_NB doesnt want negative values
+    # MULTINOMIAL_NB = auto(), MultinomialNB, {}, Task.clf_sl(), False
+    # COMPLEMENT_NB, IDK
+    # COMPLEMENT_NB = auto(), ComplementNB, {}, Task.clf_sl(), False
+    SGD_CLF = (
+        auto(),
+        SGDClassifier,
+        {"max_iter": 1000, "tol": 1e-3},
+        Task.clf_sl(),
+        True,
+    )
+    PASSIVE_AGGRESSIVE_CLF = (
+        auto(),
+        PassiveAggressiveClassifier,
+        {"max_iter": 1000},
+        Task.clf_sl(),
+        True,
+    )
+    # XGBOOST_CLF = (
+    #     auto(),
+    #     XGBClassifier,
+    #     {"n_estimators": 100, "learning_rate": 0.1},
+    #     Task.clf_sl(),
+    #     False,
+    #     "XGBoostClassifier",
+    # )
+    LIGHTGBM_CLF = (
+        auto(),
+        LGBMClassifier,
+        {"n_estimators": 100},
+        Task.clf_sl(),
+        False,
+        "LightGBMClassifier",
+    )
+    VOTING_CLF = (
+        auto(),
+        VotingClassifier,
+        {"estimators": base_est_classifier()},
+        Task.clf_sl(),
+        False,
+    )
+    STACKING_CLF = (
+        auto(),
+        StackingClassifier,
+        {"estimators": base_est_classifier()},
+        Task.clf_sl(),
+        False,
+    )
 
+    # Regression Models
     RF_REGR = auto(), RandomForestRegressor, {}, Task.regr_sl(), False
     MLP_REGR = auto(), MLPRegressor, {"max_iter": 2000}, Task.regr_ml(), True
     KNN_REGR = auto(), KNeighborsRegressor, {}, Task.regr_ml(), False
@@ -176,16 +270,81 @@ class ModelClass(ModelClassElement, Enum):
     VOTING_REGR = (
         auto(),
         VotingRegressor,
-        {"base_estimators": base_est_regressor()},
+        {"estimators": base_est_regressor()},
         Task.regr_sl(),
         False,
     )
     STACKING_REGR = (
         auto(),
         StackingRegressor,
-        {"base_estimators": base_est_regressor()},
+        {"estimators": base_est_regressor()},
         Task.regr_sl(),
         False,
+    )
+    # New Regression Models
+    LINEAR_REGRESSION = auto(), LinearRegression, {}, Task.regr_sl(), False
+    RIDGE = auto(), Ridge, {"alpha": 1.0}, Task.regr_sl(), True
+    LASSO = auto(), Lasso, {"alpha": 1.0, "max_iter": 1000}, Task.regr_sl(), True
+    ELASTIC_NET = (
+        auto(),
+        ElasticNet,
+        {"alpha": 1.0, "l1_ratio": 0.5, "max_iter": 1000},
+        Task.regr_sl(),
+        True,
+    )
+    SVR = auto(), SVR, {"kernel": "rbf", "max_iter": 2000}, Task.regr_sl(), False
+    LINEAR_SVR = (
+        auto(),
+        LinearSVR,
+        {"max_iter": 2000, "dual": "auto"},
+        Task.regr_sl(),
+        False,
+    )
+    DECISION_TREE_REGR = auto(), DecisionTreeRegressor, {}, Task.regr_sl(), False
+    SGD_REGR = (
+        auto(),
+        SGDRegressor,
+        {"max_iter": 1000, "tol": 1e-3},
+        Task.regr_sl(),
+        True,
+    )
+    PASSIVE_AGGRESSIVE_REGR = (
+        auto(),
+        PassiveAggressiveRegressor,
+        {"max_iter": 1000},
+        Task.regr_sl(),
+        True,
+    )
+    HUBER_REGR = (
+        auto(),
+        HuberRegressor,
+        {"max_iter": 100, "epsilon": 1.35},
+        Task.regr_sl(),
+        False,
+    )
+    POISSON_REGR = auto(), PoissonRegressor, {"max_iter": 100}, Task.regr_sl(), False
+    GAMMA_REGR = auto(), GammaRegressor, {"max_iter": 100}, Task.regr_sl(), False
+    TWEEDIE_REGR = (
+        auto(),
+        TweedieRegressor,
+        {"power": 1.5, "max_iter": 100},
+        Task.regr_sl(),
+        False,
+    )
+    # XGBOOST_REGR = (
+    #     auto(),
+    #     XGBoostReg,
+    #     {"n_estimators": 100, "learning_rate": 0.1},
+    #     Task.regr_sl(),
+    #     False,
+    # )
+    LIGHTGBM_REGR = (
+        auto(),
+        LGBMRegressor,
+        {"n_estimators": 100},
+        Task.regr_sl(),
+        False,
+        "LightGBMRegressor",
     )
 
     def __new__(
@@ -574,7 +733,7 @@ def opt_base_model(X, Y, task: Task, do_cv: bool = True):
             for step, score in tq2:
                 cv_scores.append(score)
                 tq2.set_description(
-                    f"CV split {step}/{cpcv.n_splits}: {min_of_mean_median(cv_scores):.4f}"
+                    f"CV split {step+1}/{cpcv.n_splits}: {min_of_mean_median(cv_scores):.4f}"
                 )
 
             overall_scores.append(min_of_mean_median(cv_scores))
@@ -604,7 +763,7 @@ def opt_base_model(X, Y, task: Task, do_cv: bool = True):
             for step, score in tq2:
                 cv_scores.append(score)
                 tq2.set_description(
-                    f"CV split {step}/{cv.n_splits}: {min_of_mean_median(cv_scores):.4f}"
+                    f"CV split {step + 1}/{cv.n_splits}: {min_of_mean_median(cv_scores):.4f}"
                 )
 
             overall_scores.append(min_of_mean_median(cv_scores))
