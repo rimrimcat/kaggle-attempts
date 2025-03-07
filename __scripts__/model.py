@@ -187,7 +187,6 @@ class ModelClass(ModelClassElement, Enum):
         Task.clf_sl(),
         False,
     )
-    # New Classification Models
     LOGISTIC_REGRESSION = (
         auto(),
         LogisticRegression,
@@ -196,7 +195,7 @@ class ModelClass(ModelClassElement, Enum):
         True,
     )
     DECISION_TREE_CLF = auto(), DecisionTreeClassifier, {}, Task.clf_sl(), False
-    SVC = auto(), SVC, {"kernel": "rbf", "max_iter": 2000}, Task.clf_sl(), False
+    SVC = auto(), SVC, {"kernel": "rbf", "max_iter": 4000}, Task.clf_sl(), False
     LINEAR_SVC = (
         auto(),
         LinearSVC,
@@ -281,7 +280,6 @@ class ModelClass(ModelClassElement, Enum):
         Task.regr_sl(),
         False,
     )
-    # New Regression Models
     LINEAR_REGRESSION = auto(), LinearRegression, {}, Task.regr_sl(), False
     RIDGE = auto(), Ridge, {"alpha": 1.0}, Task.regr_sl(), True
     LASSO = auto(), Lasso, {"alpha": 1.0, "max_iter": 1000}, Task.regr_sl(), True

@@ -8,6 +8,7 @@ from typing import (
     Optional,
     Sequence,
     TypeAlias,
+    TypedDict,
     Union,
     cast,
 )
@@ -52,7 +53,7 @@ from __scripts__.plot import (
     plot_scree,
     tabulate_feature_corr,
 )
-from __scripts__.typ import DataType, DataTypeDict, Task
+from __scripts__.typ import BaseType, DataType, DataTypeDict, Task
 
 logging.basicConfig(
     level=logging.INFO,
@@ -324,13 +325,16 @@ class ColumnTransformer(_ColumnTransformer):
                     X[:, ind_dict[name].start : ind_dict[name].stop]
                 )
 
-            elif trans in ("drop",):
-                arr = np.zeros(
-                    (X.shape[0], ind_dict[name].stop - ind_dict[name].start + 1)
-                )
+            # elif trans in ("drop",):
+            #     arr = np.zeros(
+            #         (X.shape[0], ind_dict[name].stop - ind_dict[name].start + 1)
+            #     )
 
             elif trans in ("passthrough",):
                 arr = X[:, ind_dict[name].start : ind_dict[name].stop]
+
+            else:
+                continue
 
             arrays.append(arr)
 
@@ -365,13 +369,11 @@ class ColumnTransformer(_ColumnTransformer):
                 pass
             elif missforest is True and hasattr(self, "_dtype_dict"):
                 dtype_dict = self._dtype_dict
-                categorical_ = [
-                    col for col, d in dtype_dict.items() if d.is_categorical()
-                ]
+                categorical_ = [col for col, d in dtype_dict.items() if d.categorical]
 
                 drop_slice = slice(0, 0, None)
 
-                trans_names = [x[0] for x in self._transformers]
+                # trans_names = [x[0] for x in self._transformers]
                 categorical = [
                     col
                     for col in categorical_
@@ -425,25 +427,35 @@ class ColumnTransformer(_ColumnTransformer):
     @staticmethod
     def _create_column_transformer(
         df: pd.DataFrame,
-        dtype_dict: dict[str, DataType],
+        dtype_dict: DataTypeDict,
         trans_dict: Optional[dict[str, Union[BaseEstimator, _BaseEncoder]]] = None,
     ):
         transformers: transform_list = []
 
         for col in df.columns:
-            if trans_dict and col in trans_dict:
-                transformers.append(
-                    (
-                        col,
-                        trans_dict[col],
-                        [col],
+            if trans_dict:
+                if col in trans_dict:
+                    transformers.append(
+                        (
+                            col,
+                            trans_dict[col],
+                            [col],
+                        )
                     )
-                )
-                continue
+                    continue
+                elif col not in trans_dict and "remainder" in trans_dict:
+                    transformers.append(
+                        (
+                            col,
+                            clone(trans_dict["remainder"]),
+                            [col],
+                        )
+                    )
+                    continue
 
             dtype: DataType = dtype_dict[col]
 
-            if dtype.is_continuous():
+            if dtype.continuous:
                 transformers.append(
                     (
                         col,
@@ -451,7 +463,7 @@ class ColumnTransformer(_ColumnTransformer):
                         [col],
                     )
                 )
-            elif dtype.is_binary() or dtype.is_ordinal():
+            elif dtype.binary or dtype.ordinal:
                 categories = df[col].dropna().unique()
                 categories.sort()
                 transformers.append(
@@ -466,7 +478,7 @@ class ColumnTransformer(_ColumnTransformer):
                         [col],
                     )
                 )
-            elif dtype.is_categorical() and not dtype.is_ordinal():
+            elif dtype.categorical and not dtype.ordinal:
                 categories = df[col].dropna().unique()
                 transformers.append(
                     (
@@ -629,13 +641,11 @@ class ColumnTransformer(_ColumnTransformer):
         df: pd.DataFrame,
         labels: Union[str, list[str]],
         trans_dict: Optional[dict[str, Union[BaseEstimator, _BaseEncoder]]] = None,
-        dtype_dict: Optional[DataTypeDict] = None,
     ) -> tuple["ColumnTransformer", "ColumnTransformer"]:
         if isinstance(labels, str):
             labels = [labels]
 
-        if dtype_dict is None:
-            dtype_dict = df.attrs["dtype_dict"]
+        dtype_dict = df.attrs["dtype_dict"]
 
         x_cols = [col for col in df.columns if col not in labels]
         df_X = df[x_cols]
@@ -652,6 +662,16 @@ class ColumnTransformer(_ColumnTransformer):
         trans_Y._dtype_dict = dtype_dict
 
         return (trans_X, trans_Y)
+
+
+class SummaryDict(TypedDict):
+    n_cols: int
+    n_rows: int
+    nan_cols: dict[str, int]
+    nan_rows: int
+    nans: int
+    data_types: list[DataType]
+    data_types_df: pd.DataFrame
 
 
 def summarize_data(df: pd.DataFrame, print_summary: bool = True):
@@ -680,7 +700,7 @@ def summarize_data(df: pd.DataFrame, print_summary: bool = True):
     nans = df.isna().sum().sum()
 
     # Create subdf for data types
-    data_types = []
+    data_types: list[DataType] = []
     values = []
     for col in cols:
         dtype = DataType.infer_ser_dtype(df[col])
@@ -688,33 +708,55 @@ def summarize_data(df: pd.DataFrame, print_summary: bool = True):
 
         unique_values = df[col].dropna().unique()
         # if not isinstance(unique_values, Categorical):
-        if dtype not in [DataType.CATEGORICAL_ORDINAL_STRING, DataType.TIME_DATA]:
+        if dtype not in [
+            DataType.CATEGORICAL_ORDINAL_STRING,
+            DataType.CATEGORICAL_ORDINAL_BINARY_STRING,
+            DataType.TIME_DATA,
+        ]:
             unique_values.sort()
         uv = unique_values.tolist()
         value = ""
-        match dtype:
-            case (
-                DataType.CATEGORICAL_NOMINAL_BINARY
-                | DataType.CATEGORICAL_ORDINAL_BINARY
-            ):
-                value = f"{uv[0]}, {uv[1]}"
-            case (
-                DataType.CATEGORICAL_NOMINAL_STRING
-                | DataType.CATEGORICAL_ORDINAL_STRING
-            ):
-                value = ", ".join(uv)
-            case DataType.CATEGORICAL_INTEGER:
-                value = ", ".join([str(v) for v in uv])
-            case DataType.NUMERIC:
-                n_unique = df[col].dropna().unique()
-                if isinstance(n_unique.min(), float):
-                    value = f"min: {round(n_unique.min(), 2)}, max: {round(n_unique.max(), 2)}, x̄: {df[col].mean().round(2)}, σ: {df[col].std().round(2)}"
-                else:
-                    value = f"min: {n_unique.min().round(2)}, max: {n_unique.max().round(2)}, x̄: {df[col].mean().round(2)}, σ: {df[col].std().round(2)}"
-            case _:
-                value = ", ".join([str(u) for u in uv])
 
-        if len(value) > 50 and not dtype.is_continuous():
+        if dtype.binary:
+            value = f"{uv[0]}, {uv[1]}"
+        elif dtype.categorical and dtype.base == BaseType.STR:
+            value = ", ".join(uv)
+        elif dtype.categorical and dtype.base == BaseType.INT:
+            value = ", ".join([str(v) for v in uv])
+        elif dtype.continuous:
+            n_unique = df[col].dropna().unique()
+            if isinstance(n_unique.min(), float):
+                value = f"min: {round(n_unique.min(), 2)}, max: {round(n_unique.max(), 2)}, x̄: {df[col].mean().round(2)}, σ: {df[col].std().round(2)}"
+            else:
+                value = f"min: {n_unique.min().round(2)}, max: {n_unique.max().round(2)}, x̄: {df[col].mean().round(2)}, σ: {df[col].std().round(2)}"
+        else:
+            value = ", ".join([str(u) for u in uv])
+
+        # match dtype:
+        #     case (
+        #         DataType.CATEGORICAL_BINARY_BOOL
+        #         | DataType.CATEGORICAL_BINARY_INT
+        #         | DataType.CATEGORICAL_NOMINAL_BINARY_STRING
+        #         | DataType.CATEGORICAL_ORDINAL_BINARY_STRING
+        #     ):
+        #         value = f"{uv[0]}, {uv[1]}"
+        #     case (
+        #         DataType.CATEGORICAL_NOMINAL_STRING
+        #         | DataType.CATEGORICAL_ORDINAL_STRING
+        #     ):
+        #         value = ", ".join(uv)
+        #     case DataType.CATEGORICAL_INTEGER:
+        #         value = ", ".join([str(v) for v in uv])
+        #     case DataType.NUMERIC:
+        #         n_unique = df[col].dropna().unique()
+        #         if isinstance(n_unique.min(), float):
+        #             value = f"min: {round(n_unique.min(), 2)}, max: {round(n_unique.max(), 2)}, x̄: {df[col].mean().round(2)}, σ: {df[col].std().round(2)}"
+        #         else:
+        #             value = f"min: {n_unique.min().round(2)}, max: {n_unique.max().round(2)}, x̄: {df[col].mean().round(2)}, σ: {df[col].std().round(2)}"
+        #     case _:
+        #         value = ", ".join([str(u) for u in uv])
+
+        if len(value) > 50 and not dtype.continuous:
             value = f"({len(uv)} unique values) {value}"
             if value.endswith("..."):
                 pass
@@ -730,7 +772,7 @@ def summarize_data(df: pd.DataFrame, print_summary: bool = True):
     data_types_df = pd.DataFrame(
         {
             "Column": cols,
-            "Data Type": [d.name for d in data_types],
+            "Data Type": [d._name_ for d in data_types],
             "Values": values,
             "Notes": ["" for d in data_types],
         }
@@ -818,8 +860,14 @@ def clean_data(
     summary_1 = summarize_data(df, print_summary=False)
 
     if drop_uninformative:
-        df = df[[col for dt, col in zip(summary_1["data_types"], df.columns) if dt]]
-
+        df = df[
+            [
+                col
+                for dt, col in zip(summary_1["data_types"], df.columns)
+                if dt.base is not BaseType.UNK
+            ]
+        ]
+        
     if drop_missing_rows:
         df = df.dropna()
 
@@ -829,7 +877,8 @@ def clean_data(
         if drop_uninformative:
             mod_data_types_df: pd.DataFrame = summary_1["data_types_df"]
             mod_data_types_df["Notes"] = [
-                "DROPPED" if d.should_drop else "" for d in summary_1["data_types"]
+                "DROPPED" if d.base == BaseType.UNK else ""
+                for d in summary_1["data_types"]
             ]
             if add_new_features and added_features:
                 for ft in added_features:
@@ -847,7 +896,7 @@ def clean_data(
             }
 
             new_indices = [
-                "" if d.should_drop else col2newi[i2col[ind]]
+                "" if d.base == BaseType.UNK else col2newi[i2col[ind]]
                 for ind, d in zip(
                     mod_data_types_df.index.astype(str), summary_1["data_types"]
                 )
@@ -900,12 +949,9 @@ def check_corr(
     x_cols = df.columns.drop(label).to_list()
     y = label
 
-    n_plots = len(x_cols)
-
     tabulate_feature_corr(df)
-
-    plot_counts(df, num_plots_x, ceil((n_plots + 1) / num_plots_x))
-    plot_feature_label_corr(df, x_cols, y, num_plots_x, ceil(n_plots / num_plots_x))
+    plot_counts(df)
+    plot_feature_label_corr(df, y, x_cols)
 
 
 def do_pca(

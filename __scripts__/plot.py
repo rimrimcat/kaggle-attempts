@@ -1,8 +1,10 @@
 from concurrent.futures.thread import ThreadPoolExecutor
+from functools import partial
 from itertools import combinations
 from math import ceil
 from typing import (
     Any,
+    Callable,
     Optional,
     Sequence,
     cast,
@@ -15,6 +17,7 @@ import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap, hex2color, rgb2hex
 from numpy.typing import NDArray
 from pandas import Categorical
+from scipy.signal import savgol_filter
 from scipy.stats import (
     chi2_contingency,
     chisquare,
@@ -23,9 +26,10 @@ from scipy.stats import (
     spearmanr,
 )
 from sklearn.decomposition import PCA
+from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
 
-from __scripts__.typ import BasicDataType, StatResult
+from __scripts__.typ import BaseType, DataType, DataTypeDict, StatResult
 
 DEFAULT_FIGSIZE = (32, 18)
 DEFAULT_FONTSIZE = 24  # TODO: IMPLEMENT
@@ -42,6 +46,18 @@ plt.rcParams.update(
     }
 )
 # sns.set_context("paper", rc={"font.size":DEFAULT_FONTSIZE,"axes.titlesize":8,"axes.labelsize":5})
+
+
+class FigSize:
+    DEFAULT = (20, 14)
+
+    @staticmethod
+    def from_subplots(x: int, y: int):
+        return (12 * x, 5 * y)
+
+    @staticmethod
+    def from_table(rows: int, cols: int):
+        return (8 + 2 * rows, 4 + cols)
 
 
 def assign_colors(class_list: Sequence[Any], color_list=None):
@@ -89,116 +105,195 @@ def assign_colors(class_list: Sequence[Any], color_list=None):
 def find_corr(
     x: pd.Series,
     y: pd.Series,
-    x_type: BasicDataType,
-    y_type: BasicDataType,
+    x_type: DataType,
+    y_type: DataType,
 ):
-    if x_type.is_categorical():
+    if x_type.categorical:
         x_cats = x.unique()
         if not isinstance(x_cats, Categorical):
             x_cats.sort()
 
-    if y_type.is_categorical():
+    if y_type.categorical:
         y_cats = y.unique()
         if not isinstance(y_cats, Categorical):
             y_cats.sort()
 
-    match x_type, y_type:
-        # Main reference is doi:10.1177/8756479308317006
-        case BasicDataType.CONTINUOUS, BasicDataType.CONTINUOUS:
-            # spearmanr
-            # can also use pearson r
+    if x_type.continuous and y_type.continuous:
+        # spearmanr
+        # can also use pearson r
 
-            res_kw = spearmanr(x, y, alternative="two-sided")
-            return StatResult(r"\rho", res_kw.statistic, res_kw.pvalue)
+        res_kw = spearmanr(x, y, alternative="two-sided")
+        return StatResult(r"\rho", res_kw.statistic, res_kw.pvalue)
+    elif x_type.ordinal and y_type.ordinal:
+        # kendall tau b or c
+        # can also be spearmanr
 
-        case BasicDataType.ORDINAL, BasicDataType.ORDINAL:
-            # kendall tau b or c
-            # can also be spearmanr
-
-            if len(x_cats) == len(y_cats):
-                res_kw = kendalltau(x, y, variant="b", alternative="two-sided")
-            else:
-                res_kw = kendalltau(x, y, variant="c", alternative="two-sided")
-            return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
-
-        case BasicDataType.NOMINAL, BasicDataType.NOMINAL:
-            # goodman and kruskal lambda
-
-            # table = pd.DataFrame(index=x_cats, columns=y_cats)
-            # for x_cat in x_cats:
-            #     for y_cat in y_cats:
-            #         xdf = df.loc[df["x"] == x_cat]
-            #         xydf = xdf.loc[xdf["y"] == y_cat]
-            #         table.loc[x_cat, y_cat] = len(xydf)
-            table = pd.crosstab(x, y)
-
-            # sum of overall non-modal frequency
-            y_sums = table.sum(axis=0)
-            e1 = y_sums.loc[y_sums != y_sums.max()].sum()
-
-            # sum of non-model frequency per independent variable
-            x_maxes = table.max(axis=1).sum()
-            e2 = table.sum().sum() - x_maxes
-            gk_lambda = min((e1 - e2) / e1, 0)
-
-            #! UNUSED, CRAMER'S
-            res_chi2 = chi2_contingency(table)
-
-            n = table.sum().sum()
-            min_dim = min(table.shape) - 1
-            cramers_v = np.sqrt(res_chi2.statistic / (n * min_dim))
-            #! UNUSED
-
-            if cramers_v > gk_lambda:
-                return StatResult(r"\phi _c", cramers_v, res_chi2.pvalue)
-            else:
-                return StatResult(r"\lambda", gk_lambda, None)
-
-        case BasicDataType.CONTINUOUS, BasicDataType.ORDINAL:
-            # kendalltau b
-            # can also be spearmanr
-
+        if len(x_cats) == len(y_cats):
             res_kw = kendalltau(x, y, variant="b", alternative="two-sided")
-            return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
+        else:
+            res_kw = kendalltau(x, y, variant="c", alternative="two-sided")
+        return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
+    elif x_type.nominal and y_type.nominal:
+        # goodman and kruskal lambda
 
-        case BasicDataType.NOMINAL, BasicDataType.ORDINAL:
-            # chi-square and cramer's v
-            contingency_table = pd.crosstab(x, y)
-            res = chi2_contingency(contingency_table)
+        # table = pd.DataFrame(index=x_cats, columns=y_cats)
+        # for x_cat in x_cats:
+        #     for y_cat in y_cats:
+        #         xdf = df.loc[df["x"] == x_cat]
+        #         xydf = xdf.loc[xdf["y"] == y_cat]
+        #         table.loc[x_cat, y_cat] = len(xydf)
+        table = pd.crosstab(x, y)
 
-            n = contingency_table.sum().sum()
-            min_dim = min(contingency_table.shape) - 1
+        # sum of overall non-modal frequency
+        y_sums = table.sum(axis=0)
+        e1 = y_sums.loc[y_sums != y_sums.max()].sum()
 
-            if min_dim == 0:
-                # No group
-                return None
+        # sum of non-model frequency per independent variable
+        x_maxes = table.max(axis=1).sum()
+        e2 = table.sum().sum() - x_maxes
+        gk_lambda = min((e1 - e2) / e1, 0)
 
-            cramers_v = np.sqrt(res.statistic / (n * min_dim))
+        #! UNUSED, CRAMER'S
+        res_chi2 = chi2_contingency(table)
 
-            return StatResult(r"\phi _c", cramers_v, res.pvalue)
+        n = table.sum().sum()
+        min_dim = min(table.shape) - 1
+        cramers_v = np.sqrt(res_chi2.statistic / (n * min_dim))
+        #! UNUSED
 
-        case BasicDataType.CONTINUOUS, BasicDataType.NOMINAL:
-            # point biserial
-            # but probably will never encounter this?
+        if cramers_v > gk_lambda:
+            return StatResult(r"\phi _c", cramers_v, res_chi2.pvalue)
+        else:
+            return StatResult(r"\lambda", gk_lambda, None)
 
-            pass
+    elif x_type.continuous and y_type.ordinal:
+        # kendalltau b
+        # can also be spearmanr
+
+        res_kw = kendalltau(x, y, variant="b", alternative="two-sided")
+        return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
+    elif x_type.nominal and y_type.ordinal:
+        # chi-square and cramer's v
+        contingency_table = pd.crosstab(x, y)
+        res = chi2_contingency(contingency_table)
+
+        n = contingency_table.sum().sum()
+        min_dim = min(contingency_table.shape) - 1
+
+        if min_dim == 0:
+            # No group
+            return None
+
+        cramers_v = np.sqrt(res.statistic / (n * min_dim))
+
+        return StatResult(r"\phi _c", cramers_v, res.pvalue)
+    elif x_type.continuous and y_type.ordinal:
+        # point biserial
+        # but probably will never encounter this?
+        pass
+
+    # match x_type, y_type:
+    #     # Main reference is doi:10.1177/8756479308317006
+    #     case BasicDataType.CONTINUOUS, BasicDataType.CONTINUOUS:
+    #         # spearmanr
+    #         # can also use pearson r
+
+    #         res_kw = spearmanr(x, y, alternative="two-sided")
+    #         return StatResult(r"\rho", res_kw.statistic, res_kw.pvalue)
+
+    #     case BasicDataType.ORDINAL, BasicDataType.ORDINAL:
+    #         # kendall tau b or c
+    #         # can also be spearmanr
+
+    #         if len(x_cats) == len(y_cats):
+    #             res_kw = kendalltau(x, y, variant="b", alternative="two-sided")
+    #         else:
+    #             res_kw = kendalltau(x, y, variant="c", alternative="two-sided")
+    #         return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
+
+    #     case BasicDataType.NOMINAL, BasicDataType.NOMINAL:
+    #         # goodman and kruskal lambda
+
+    #         # table = pd.DataFrame(index=x_cats, columns=y_cats)
+    #         # for x_cat in x_cats:
+    #         #     for y_cat in y_cats:
+    #         #         xdf = df.loc[df["x"] == x_cat]
+    #         #         xydf = xdf.loc[xdf["y"] == y_cat]
+    #         #         table.loc[x_cat, y_cat] = len(xydf)
+    #         table = pd.crosstab(x, y)
+
+    #         # sum of overall non-modal frequency
+    #         y_sums = table.sum(axis=0)
+    #         e1 = y_sums.loc[y_sums != y_sums.max()].sum()
+
+    #         # sum of non-model frequency per independent variable
+    #         x_maxes = table.max(axis=1).sum()
+    #         e2 = table.sum().sum() - x_maxes
+    #         gk_lambda = min((e1 - e2) / e1, 0)
+
+    #         #! UNUSED, CRAMER'S
+    #         res_chi2 = chi2_contingency(table)
+
+    #         n = table.sum().sum()
+    #         min_dim = min(table.shape) - 1
+    #         cramers_v = np.sqrt(res_chi2.statistic / (n * min_dim))
+    #         #! UNUSED
+
+    #         if cramers_v > gk_lambda:
+    #             return StatResult(r"\phi _c", cramers_v, res_chi2.pvalue)
+    #         else:
+    #             return StatResult(r"\lambda", gk_lambda, None)
+
+    #     case BasicDataType.CONTINUOUS, BasicDataType.ORDINAL:
+    #         # kendalltau b
+    #         # can also be spearmanr
+
+    #         res_kw = kendalltau(x, y, variant="b", alternative="two-sided")
+    #         return StatResult(r"\tau", res_kw.statistic, res_kw.pvalue)
+
+    #     case BasicDataType.NOMINAL, BasicDataType.ORDINAL:
+    #         # chi-square and cramer's v
+    #         contingency_table = pd.crosstab(x, y)
+    #         res = chi2_contingency(contingency_table)
+
+    #         n = contingency_table.sum().sum()
+    #         min_dim = min(contingency_table.shape) - 1
+
+    #         if min_dim == 0:
+    #             # No group
+    #             return None
+
+    #         cramers_v = np.sqrt(res.statistic / (n * min_dim))
+
+    #         return StatResult(r"\phi _c", cramers_v, res.pvalue)
+
+    #     case BasicDataType.CONTINUOUS, BasicDataType.NOMINAL:
+    #         # point biserial
+    #         # but probably will never encounter this?
+
+    #         pass
 
     return None
 
 
 def plot_counts(
     df: pd.DataFrame,
-    num_plots_x: int,
-    num_plots_y: int,
+    num_plots_x: int = 4,
+    num_plots_y: Optional[int] = None,
 ):
     dtype_dict = df.attrs["dtype_dict"]
+
+    n_plots = len(df.columns)
+
+    if num_plots_y is None:
+        num_plots_y = ceil((n_plots + 1) / num_plots_x)
 
     fig, axes = plt.subplots(num_plots_y, num_plots_x, figsize=DEFAULT_FIGSIZE)
     fig.tight_layout()
     axes = axes.flatten()
 
     def _make_subplot(_i, _x):
-        if dtype_dict[_x].is_categorical():
+        if dtype_dict[_x].categorical:
             filter_df = df[_x].dropna().sort_values(ascending=True)
 
             sns.countplot(x=filter_df.astype(str), ax=axes[_i])
@@ -222,7 +317,7 @@ def plot_counts(
         for x in tq:
             tq.set_description(f"Creating count plot: {x}")
 
-    n_diff = num_plots_x * num_plots_y - len(df.columns)
+    n_diff = num_plots_x * num_plots_y - n_plots
     if n_diff:
         for i in range(n_diff):
             fig.delaxes(axes[-(i + 1)])
@@ -252,15 +347,15 @@ def tabulate_feature_corr(
         resxy = find_corr(
             filter_df[x],
             filter_df[y],
-            dtype_dict[x].basic_type,
-            dtype_dict[y].basic_type,
+            dtype_dict[x],
+            dtype_dict[y],
         )
 
         resyx = find_corr(
             filter_df[y],
             filter_df[x],
-            dtype_dict[y].basic_type,
-            dtype_dict[x].basic_type,
+            dtype_dict[y],
+            dtype_dict[x],
         )
 
         if resxy:
@@ -271,7 +366,7 @@ def tabulate_feature_corr(
 
     # annot_df = np.vectorize(make_annot)(corr_df)
 
-    plt.figure(figsize=(8 + 2 * n, 4 + n))
+    plt.figure(figsize=FigSize.from_table(n, n))
     sns.heatmap(
         corr_df,
         fmt=".4f",
@@ -289,7 +384,7 @@ def tabulate_feature_corr(
         rotation=70,
     )
 
-    plt.show()
+    plt.show(block=False)
 
 
 def plot_feature_label_corr(
@@ -300,19 +395,20 @@ def plot_feature_label_corr(
     num_plots_y: Optional[int] = None,
     alpha: float = 0.05,
 ):
+    dtype_dict: DataTypeDict = df.attrs["dtype_dict"]
 
     if not x_cols:
-        x_cols = df.columns.drop(y).to_list()
+        x_cols_ = df.columns.drop(y).to_list()
+        x_cols = [col for col in x_cols_ if not dtype_dict[col].base == BaseType.UNK]
 
     if not num_plots_y:
         num_plots_y = ceil(len(x_cols) / num_plots_x)
 
-    dtype_dict = df.attrs["dtype_dict"]
-
     fig, axes = plt.subplots(
         num_plots_y,
         num_plots_x,
-        figsize=DEFAULT_FIGSIZE,
+        # figsize=DEFAULT_FIGSIZE,
+        figsize=FigSize.from_subplots(num_plots_x, num_plots_y),
     )
     fig.tight_layout()
     axes = axes.flatten()
@@ -322,10 +418,10 @@ def plot_feature_label_corr(
         filter_df = df[[_x, y]].dropna()
         filter_df.sort_values(by=[y, _x], ascending=False, inplace=True)
 
-        x_dtype = dtype_dict[_x].basic_type
-        y_dtype = dtype_dict[y].basic_type
+        x_dtype = dtype_dict[_x]
+        y_dtype = dtype_dict[y]
 
-        if x_dtype.is_categorical():
+        if x_dtype.categorical:
             x_cats: NDArray = filter_df[_x].unique()
             if not isinstance(x_cats, Categorical):
                 x_cats.sort()
@@ -336,7 +432,7 @@ def plot_feature_label_corr(
             order = None
             plot_x = filter_df[_x]
 
-        if y_dtype.is_categorical():
+        if y_dtype.categorical:
             y_cats: NDArray = filter_df[y].unique()
             if not isinstance(y_cats, Categorical):
                 y_cats.sort()
@@ -345,14 +441,14 @@ def plot_feature_label_corr(
         else:
             plot_y = filter_df[y]
 
-        if x_dtype.is_continuous() and y_dtype.is_categorical():
+        if x_dtype.continuous and y_dtype.categorical:
             sns.violinplot(
                 x=plot_x,
                 y=plot_y,
                 order=order,
                 ax=axes[_i],
             )
-        elif x_dtype.is_categorical and y_dtype.is_categorical():
+        elif x_dtype.categorical and y_dtype.categorical:
             table = pd.crosstab(
                 index=filter_df[y],
                 columns=filter_df[_x],
@@ -418,7 +514,9 @@ def plot_feature_label_corr(
                     )
 
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                f"Ploting feature with type {x_dtype._name_} and label with type {y_dtype._name_} not implemented yet!"
+            )
 
         res = find_corr(filter_df[_x], filter_df[y], x_dtype, y_dtype)
         if res:
@@ -454,6 +552,96 @@ def plot_feature_label_corr(
     # plt.suptitle("Bivariate Violin Plots")
     plt.subplots_adjust(hspace=0.5)
     plt.show(block=False)
+
+
+def plot_ts_clf_label(
+    df: pd.DataFrame,
+    label: str,
+    ts: Optional[str] = None,
+    features: Optional[list[str]] = None,
+    test_df: Optional[pd.DataFrame] = None,
+    smoothing: Optional[Callable] = partial(savgol_filter, polyorder=2),
+    window_frac: float = 0.05,
+    smooth_every: float = 0.025,
+):
+
+    if ts is None:
+        # Get the first TimeData dtype
+        dtype_dict = df.attrs["dtype_dict"]
+
+        for col in df.columns:
+            if dtype_dict[col] == DataType.TIME_DATA:
+                ts = col
+                break
+        else:
+            raise ValueError("Provided dataframe doesn't contain time series column!")
+
+    if features is None:
+        features = []
+        # Get the first three features
+        for col in df.columns:
+            if col not in [ts, label]:
+                if len(features) < 3:
+                    features.append(col)
+                else:
+                    break
+    feature_markers = ["o", "^", "+"]
+
+    df = df.sort_values(by=ts, ascending=True)
+
+    X = df[ts]
+
+    # Decimal X, for plotting
+    X_dec = (X - X.iloc[0]) / (X.iloc[-1] - X.iloc[0])
+
+    Y = df[label]
+
+    Y_cols = assign_colors(Y.unique())
+
+    fig = plt.figure(figsize=FigSize.DEFAULT)
+
+    window_length = int(window_frac * len(X))
+    plot_length = int(smooth_every * len(X))
+
+    p_x = X_dec.to_numpy().ravel()
+
+    for i, f in enumerate(features):
+        scaler = MinMaxScaler()
+        f_scaled = scaler.fit_transform(df[f].to_numpy().reshape(-1, 1))
+
+        p_f = f_scaled.ravel()
+        if smoothing:
+            plt.plot(
+                p_x[::plot_length],
+                smoothing(p_f, window_length)[::plot_length],
+                marker=feature_markers[i],
+                label=f,
+            )
+
+            plt.scatter(
+                p_x,
+                p_f,
+                marker=".",
+                alpha=0.2,
+                label=None,
+            )
+
+        else:
+            plt.plot(
+                p_x,
+                p_f,
+                marker=feature_markers[i],
+            )
+
+    plt.plot(
+        p_x,
+        Y.to_numpy().ravel() * 0.1,
+        label=None,
+    )
+
+    # Add classifications
+    plt.legend()
+    plt.show()
 
 
 def plot_scree(
@@ -640,6 +828,7 @@ def plot_pca_loadings(
     ax.axhline(0, color="black", linewidth=0.8)
     ax.axvline(0, color="black", linewidth=0.8)
     plt.show(block=False)
+
 
 def plot_ts(X, y):
     # TODO: plot time series for visualization
